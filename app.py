@@ -7,7 +7,6 @@ from faster_whisper import WhisperModel
 
 # ================= CONFIG =================
 FFMPEG_PATH = r"C:\projects\SubtitleGenerator\ffmpeg\bin\bin\ffmpeg.exe"
-MODEL_SIZE = "small"   # change to "medium" if needed
 # =========================================
 
 USE_GPU = torch.cuda.is_available()
@@ -28,17 +27,24 @@ def format_ts(seconds):
     s = s % 60
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
+def is_repetitive(text):
+    words = text.lower().split()
+    return len(words) > 20 and len(set(words)) < len(words) * 0.3
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="Japanese → English Subtitle Generator")
 
 st.title("🎬 Japanese → English Subtitle Generator")
-st.write("GPU accelerated • No size limit • Uncensored")
 
+mode = st.selectbox("Mode", ["Fast", "Accurate"])
+MODEL_SIZE = "small" if mode == "Fast" else "medium"
+
+st.write(f"{'GPU' if USE_GPU else 'CPU'} • Model: {MODEL_SIZE} • No size limit")
 st.info("🚀 GPU (faster-whisper)" if USE_GPU else "🐢 CPU (slower)")
 
 video_path = st.text_input(
     "Enter full video path",
-    placeholder=r"C:\Users\ASUS\Downloads\Telegram Desktop\The_Big_Bang_Theory_S06E14.mkv"
+    placeholder=r"C:\Users\ASUS\Downloads\Telegram Desktop\video.mkv"
 )
 
 # ---------- Preview Panel ----------
@@ -52,13 +58,18 @@ eta_text = st.empty()
 
 if st.button("🚀 Generate Subtitles"):
     if not video_path or not os.path.exists(video_path):
-        st.error("Invalid video path")
+        st.error("❌ Invalid video path")
         st.stop()
 
     video_name = os.path.basename(video_path)
     base_name = os.path.splitext(video_name)[0]
     srt_filename = base_name + "_en.srt"
-    srt_path = os.path.join(os.path.dirname(video_path), srt_filename)
+
+    # Save SRT next to video (with fallback)
+    output_dir = os.path.dirname(video_path)
+    if not os.access(output_dir, os.W_OK):
+        output_dir = os.getcwd()
+    srt_path = os.path.join(output_dir, srt_filename)
 
     audio_path = "audio.wav"
 
@@ -85,7 +96,7 @@ if st.button("🚀 Generate Subtitles"):
 
     progress_bar.progress(20)
 
-    # ---- Transcribe (single pass, no chunking) ----
+    # ---- Transcribe ----
     status_text.text("🌍 Translating Japanese → English...")
     start_time = time.time()
 
@@ -93,38 +104,34 @@ if st.button("🚀 Generate Subtitles"):
         audio_path,
         language="ja",
         task="translate",
-        beam_size=5
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=800),
+        temperature=0.0
     )
 
-    total_segments = 0
+    segments = list(segments)
+
+    # 🔧 Clean hallucinations
+    segments = [s for s in segments if (s.end - s.start) < 60]          # remove long garbage
+    segments = [s for s in segments if not is_repetitive(s.text)]       # remove loops
+
+    total_segments = len(segments)
     collected = []
-
-    # Count segments first (for ETA)
-    for _ in segments:
-        total_segments += 1
-
-    # Re-run generator
-    segments, _ = model.transcribe(
-        audio_path,
-        language="ja",
-        task="translate",
-        beam_size=5
-    )
 
     for i, seg in enumerate(segments, start=1):
         collected.append(seg)
 
         elapsed = time.time() - start_time
         avg_time = elapsed / i
-        remaining = avg_time * (total_segments - i)
+        remaining = avg_time * (total_segments - i) if total_segments else 0
 
-        progress = 20 + int((i / total_segments) * 70)
+        progress = 20 + int((i / max(total_segments, 1)) * 70)
         progress_bar.progress(progress)
 
         status_text.text(f"📝 Processing subtitle {i}/{total_segments}")
         eta_text.text(f"⏱ ETA: {format_eta(remaining)}")
 
-        # Live preview
         preview_box.markdown(
             f"**[{format_ts(seg.start)} → {format_ts(seg.end)}]**  \n{seg.text}"
         )
@@ -134,13 +141,12 @@ if st.button("🚀 Generate Subtitles"):
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(collected, 1):
             f.write(f"{i}\n")
-            f.write(
-                f"{format_ts(seg.start)} --> {format_ts(seg.end)}\n"
-            )
+            f.write(f"{format_ts(seg.start)} --> {format_ts(seg.end)}\n")
             f.write(seg.text.strip() + "\n\n")
 
     progress_bar.progress(100)
     status_text.text("✅ Done!")
     eta_text.text("")
 
-    st.success(f"Subtitles created: {srt_filename}")
+    st.success(f"🎉 Subtitles created: {srt_filename}")
+    st.info(f"📁 Saved at: {srt_path}")
