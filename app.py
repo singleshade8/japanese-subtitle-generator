@@ -29,7 +29,20 @@ def format_ts(seconds):
 
 def is_repetitive(text):
     words = text.lower().split()
-    return len(words) > 20 and len(set(words)) < len(words) * 0.3
+
+    if len(words) < 6:
+        return False
+
+    unique_ratio = len(set(words)) / len(words)
+
+    if unique_ratio < 0.35:
+        return True
+
+    for word in set(words):
+        if words.count(word) > len(words) * 0.5:
+            return True
+
+    return False
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Japanese → English Subtitle Generator")
@@ -37,7 +50,7 @@ st.set_page_config(page_title="Japanese → English Subtitle Generator")
 st.title("🎬 Japanese → English Subtitle Generator")
 
 mode = st.selectbox("Mode", ["Fast", "Accurate"])
-MODEL_SIZE = "small" if mode == "Fast" else "medium"
+MODEL_SIZE = "small" if mode == "Fast" else "large-v3"
 
 st.write(f"{'GPU' if USE_GPU else 'CPU'} • Model: {MODEL_SIZE} • No size limit")
 st.info("🚀 GPU (faster-whisper)" if USE_GPU else "🐢 CPU (slower)")
@@ -46,7 +59,7 @@ video_path = st.text_input(
     "Enter full video path",
     placeholder=r"C:\Users\ASUS\Downloads\Telegram Desktop\video.mkv"
 )
-
+video_path = video_path.strip().strip('"')
 # ---------- Preview Panel ----------
 st.subheader("📺 Subtitle Preview (live)")
 preview_box = st.empty()
@@ -75,17 +88,58 @@ if st.button("🚀 Generate Subtitles"):
 
     # ---- Extract audio ----
     status_text.text("🎧 Extracting audio...")
-    subprocess.run([
+    result = subprocess.run(
+    [
         FFMPEG_PATH,
         "-y",
         "-i", video_path,
         "-ar", "16000",
         "-ac", "1",
         audio_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ],
+    capture_output=True,
+    text=True
+    )
 
+    if result.returncode != 0:
+        st.error("❌ FFmpeg failed")
+        st.text(result.stderr)
+        st.stop()
+
+    if not os.path.exists(audio_path):
+        st.error("❌ Audio extraction failed")
+        st.stop()
+    audio_size = os.path.getsize(audio_path) / (1024 * 1024)
+    st.write(f"🎵 Audio extracted: {audio_size:.2f} MB")
     progress_bar.progress(10)
 
+    #----------chunks----------
+    chunk_dir = "chunks"
+    if os.path.exists(chunk_dir):
+        for f in os.listdir(chunk_dir):
+            if f.endswith(".wav"):
+                os.remove(os.path.join(chunk_dir, f))
+
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    status_text.text("✂️ Splitting audio into chunks...")
+
+    subprocess.run([
+        FFMPEG_PATH,
+        "-i", audio_path,
+        "-f", "segment",
+        "-segment_time", "300",  # 5 minutes
+        "-c", "copy",
+        os.path.join(chunk_dir, "chunk_%03d.wav")
+    ], capture_output=True)
+
+    chunk_files = sorted([
+        os.path.join(chunk_dir, f)
+        for f in os.listdir(chunk_dir)
+        if f.endswith(".wav")
+    ])
+
+    st.write(f"📦 Chunks created: {len(chunk_files)}")
     # ---- Load faster-whisper ----
     status_text.text("🧠 Loading faster-whisper model...")
     model = WhisperModel(
@@ -100,49 +154,119 @@ if st.button("🚀 Generate Subtitles"):
     status_text.text("🌍 Translating Japanese → English...")
     start_time = time.time()
 
-    segments, info = model.transcribe(
-        audio_path,
-        language="ja",
-        task="translate",
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=800),
-        temperature=0.0
-    )
+    st.write("🔍 Debug: Before transcribe")
+    st.write(f"GPU Available: {torch.cuda.is_available()}")
+    st.write(f"Device: {DEVICE}")
+    st.write(f"Model: {MODEL_SIZE}")
 
-    segments = list(segments)
+    try:
+        
+        collected = []
 
+        for chunk_index, chunk_file in enumerate(chunk_files):
+
+            status_text.text(
+                f"🎙 Processing chunk {chunk_index+1}/{len(chunk_files)}"
+            )
+
+            offset = chunk_index * 300
+
+            segments, info = model.transcribe(
+                chunk_file,
+                language="ja",
+                task="translate",
+                beam_size=1,
+                best_of=1,
+                temperature=0,
+                condition_on_previous_text=False,
+                vad_filter=True,
+                word_timestamps=False,
+                vad_parameters=dict(
+                    min_silence_duration_ms=500
+                )
+            )
+
+            for seg in segments:
+
+                text = seg.text.strip()
+
+                if len(text) < 2:
+                    continue
+
+                if is_repetitive(text):
+                    continue
+
+                # shift timestamps by chunk offset
+                collected.append(
+                    (
+                        seg.start + offset,
+                        seg.end + offset,
+                        text
+                    )
+                )
+
+            progress = 20 + int(
+                ((chunk_index + 1) / len(chunk_files)) * 70
+            )
+
+            progress_bar.progress(progress)
+
+        st.write(f"✅ Total Segments: {len(collected)}")
+        collected = [
+            (start, end, text)
+            for start, end, text in collected
+            if (end - start) < 60
+        ]
+
+        collected = [
+            (start, end, text)
+            for start, end, text in collected
+            if not is_repetitive(text)
+        ]
+
+        st.write(f"✅ Segments after filtering: {len(collected)}")
+        
+    except Exception as e:
+        st.error(f"❌ Transcription Error: {str(e)}")
+        st.stop()
     # 🔧 Clean hallucinations
-    segments = [s for s in segments if (s.end - s.start) < 60]          # remove long garbage
-    segments = [s for s in segments if not is_repetitive(s.text)]       # remove loops
 
-    total_segments = len(segments)
-    collected = []
+        # elapsed = time.time() - start_time
+        # avg_time = elapsed / i
+        # remaining = avg_time * (total_segments - i) if total_segments else 0
 
-    for i, seg in enumerate(segments, start=1):
-        collected.append(seg)
+        # progress = 20 + int((i / max(total_segments, 1)) * 70)
+        # progress_bar.progress(progress)
 
-        elapsed = time.time() - start_time
-        avg_time = elapsed / i
-        remaining = avg_time * (total_segments - i) if total_segments else 0
+        # status_text.text(f"📝 Processing subtitle {i}/{total_segments}")
+        # eta_text.text(f"⏱ ETA: {format_eta(remaining)}")
 
-        progress = 20 + int((i / max(total_segments, 1)) * 70)
-        progress_bar.progress(progress)
-
-        status_text.text(f"📝 Processing subtitle {i}/{total_segments}")
-        eta_text.text(f"⏱ ETA: {format_eta(remaining)}")
-
-        preview_box.markdown(
-            f"**[{format_ts(seg.start)} → {format_ts(seg.end)}]**  \n{seg.text}"
-        )
+        # preview_box.markdown(
+        #     f"**[{format_ts(seg.start)} → {format_ts(seg.end)}]**  \n{seg.text}"
+        # )
 
     # ---- Write SRT ----
     status_text.text("📝 Writing SRT file...")
+
     with open(srt_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(collected, 1):
-            f.write(f"{i}\n")
-            f.write(f"{format_ts(seg.start)} --> {format_ts(seg.end)}\n")
-            f.write(seg.text.strip() + "\n\n")
+
+        subtitle_num = 1
+
+        for start, end, text in collected:
+
+            if len(text) < 2:
+                continue
+
+            if is_repetitive(text):
+                continue
+
+            f.write(f"{subtitle_num}\n")
+            f.write(
+                f"{format_ts(start)} --> {format_ts(end)}\n"
+            )
+            f.write(text + "\n\n")
+
+            subtitle_num += 1
 
     progress_bar.progress(100)
     status_text.text("✅ Done!")
